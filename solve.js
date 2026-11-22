@@ -352,96 +352,101 @@ function findSingleStar(s, from, end) {
   return -1;
 }
 
+/** The characters that change inline rendering: a backslash escape, a code span, emphasis, a link, or an HTML escape. */
+const INLINE_SPECIAL = /[\\`*\[&<>"']/g;
+
 /**
  * `s[a..b)` rendered inline into `out`; `link(target)` is a link's href.
- * Plain runs are pushed as whole slices, so escaping costs one pass, not
- * one regex call per character.
+ * A regex finds the next special character, so plain runs are pushed as
+ * whole slices without a JavaScript step per character; a slice is only
+ * pushed once the construct at its end is confirmed, so a special that
+ * turns out literal stays in the pending run. The regex is reset at the
+ * top of every loop turn, so the recursive calls for bold, emphasis and
+ * link text cannot disturb the caller's scan.
  */
 function inlineRange(s, a, b, link, out) {
   let i = a;
   let seg = a;
-  while (i < b) {
-    const c = s.charCodeAt(i);
-    if (c === 92 && i + 1 < b && ESCAPABLE.has(s[i + 1])) {
-      if (i > seg) out.push(s.slice(seg, i));
-      out.push(ESCAPES[s[i + 1]] ?? s[i + 1]);
-      i += 2;
-      seg = i;
+  for (;;) {
+    INLINE_SPECIAL.lastIndex = i;
+    const m = INLINE_SPECIAL.exec(s);
+    if (m === null || m.index >= b) {
+      if (b > seg) out.push(s.slice(seg, b));
+      return;
+    }
+    const j = m.index;
+    const c = s.charCodeAt(j);
+    if (c === 92) {
+      if (j + 1 < b && ESCAPABLE.has(s[j + 1])) {
+        if (j > seg) out.push(s.slice(seg, j));
+        out.push(ESCAPES[s[j + 1]] ?? s[j + 1]);
+        i = j + 2;
+        seg = i;
+      } else i = j + 1;
       continue;
     }
     if (c === 96) {
-      const j = s.indexOf('`', i + 1);
-      if (j !== -1 && j < b && j > i + 1) {
-        if (i > seg) out.push(s.slice(seg, i));
-        out.push('<code>', escapeHtml(s.slice(i + 1, j)), '</code>');
-        i = j + 1;
+      const k = s.indexOf('`', j + 1);
+      if (k !== -1 && k < b && k > j + 1) {
+        if (j > seg) out.push(s.slice(seg, j));
+        out.push('<code>', escapeHtml(s.slice(j + 1, k)), '</code>');
+        i = k + 1;
         seg = i;
-      } else i++;
+      } else i = j + 1;
       continue;
     }
     if (c === 42) {
-      if (s.charCodeAt(i + 1) === 42) {
-        const j = findUnescaped(s, '**', i + 2, b);
-        if (j !== -1 && j > i + 2) {
-          if (i > seg) out.push(s.slice(seg, i));
+      if (s.charCodeAt(j + 1) === 42) {
+        const k = findUnescaped(s, '**', j + 2, b);
+        if (k !== -1 && k > j + 2) {
+          if (j > seg) out.push(s.slice(seg, j));
           out.push('<strong>');
-          inlineRange(s, i + 2, j, link, out);
+          inlineRange(s, j + 2, k, link, out);
           out.push('</strong>');
-          i = j + 2;
+          i = k + 2;
           seg = i;
         } else {
-          if (i > seg) out.push(s.slice(seg, i));
+          if (j > seg) out.push(s.slice(seg, j));
           out.push('**');
-          i += 2;
+          i = j + 2;
           seg = i;
         }
         continue;
       }
-      const j = findSingleStar(s, i + 1, b);
-      if (j !== -1 && j > i + 1) {
-        if (i > seg) out.push(s.slice(seg, i));
+      const k = findSingleStar(s, j + 1, b);
+      if (k !== -1 && k > j + 1) {
+        if (j > seg) out.push(s.slice(seg, j));
         out.push('<em>');
-        inlineRange(s, i + 1, j, link, out);
+        inlineRange(s, j + 1, k, link, out);
         out.push('</em>');
-        i = j + 1;
+        i = k + 1;
         seg = i;
-      } else i++;
+      } else i = j + 1;
       continue;
     }
     if (c === 91) {
-      const k = findUnescaped(s, ']', i + 1, b);
-      let m = -1;
+      const k = findUnescaped(s, ']', j + 1, b);
+      let m2 = -1;
       if (k !== -1 && s[k + 1] === '(') {
         const p = s.indexOf(')', k + 2);
-        if (p !== -1 && p < b) m = p;
+        if (p !== -1 && p < b) m2 = p;
       }
-      const target = m === -1 ? '' : s.slice(k + 2, m);
+      const target = m2 === -1 ? '' : s.slice(k + 2, m2);
       if (target !== '' && !WS_RE.test(target)) {
-        if (i > seg) out.push(s.slice(seg, i));
+        if (j > seg) out.push(s.slice(seg, j));
         out.push('<a href="', escapeHtml(link(target)), '">');
-        inlineRange(s, i + 1, k, link, out);
+        inlineRange(s, j + 1, k, link, out);
         out.push('</a>');
-        i = m + 1;
+        i = m2 + 1;
         seg = i;
-      } else i++;
+      } else i = j + 1;
       continue;
     }
-    let esc;
-    if (c === 38) esc = '&amp;';
-    else if (c === 60) esc = '&lt;';
-    else if (c === 62) esc = '&gt;';
-    else if (c === 34) esc = '&quot;';
-    else if (c === 39) esc = '&#39;';
-    else {
-      i++;
-      continue;
-    }
-    if (i > seg) out.push(s.slice(seg, i));
-    out.push(esc);
-    i++;
+    if (j > seg) out.push(s.slice(seg, j));
+    out.push(c === 38 ? '&amp;' : c === 60 ? '&lt;' : c === 62 ? '&gt;' : c === 34 ? '&quot;' : '&#39;');
+    i = j + 1;
     seg = i;
   }
-  if (b > seg) out.push(s.slice(seg, b));
 }
 
 /**
@@ -480,7 +485,7 @@ function renderMarkdown(src, link, slugCache) {
       out.push('<pre><code', cls, '>', body.length === 0 ? '' : escapeHtml(`${body.join('\n')}\n`), '</code></pre>\n');
       continue;
     }
-    const heading = headingOf(line);
+    const heading = c0 === 35 ? headingOf(line) : null;
     if (heading !== null) {
       const id = uniqueSlug(slugify(heading.text, slugCache), ids);
       const tmp = [];
@@ -978,7 +983,19 @@ function build(input) {
   const site = { title: input.site.title, base_url: base };
   const allTags = tags.map((t) => ({ name: t.name, slug: t.slug, url: t.url, count: t.posts.length }));
   const recent = posts.slice(0, input.site.recent).map((p) => cards.get(p));
-  const ctx = { templates, escape: escapeHtml };
+  // Template values repeat across renders (site.title on every page, the
+  // recent posts' titles on every page, each post's title on its page, its
+  // index card and its tag pages), so escape each distinct value once per
+  // case. escapeHtml is pure, and the cache never leaves this case.
+  const escapeCache = new Map();
+  const escapeCached = (text) => {
+    const hit = escapeCache.get(text);
+    if (hit !== undefined) return hit;
+    const out = escapeHtml(text);
+    escapeCache.set(text, out);
+    return out;
+  };
+  const ctx = { templates, escape: escapeCached };
   const render = (name, vars) => {
     const nodes = templates.get(name);
     if (nodes === undefined) return null;
