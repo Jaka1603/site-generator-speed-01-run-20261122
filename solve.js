@@ -83,7 +83,6 @@ const FM_DATE = /^(\d{4})-(\d{2})-(\d{2})$/;
 const FM_NAME = /^[a-z0-9-]+$/;
 const FM_SLUG = /^[a-z0-9]+(?:-[a-z0-9]+)*$/;
 const FM_TAG = /^[^"[\]]+$/;
-const FM_BLANK = /^[ \t]*$/;
 const FM_TRAILING = /[ \t]+$/;
 
 /** The days of month `m` (1-12) of year `y`, by the Gregorian rule. */
@@ -180,7 +179,7 @@ export function parseFrontMatter(text) {
   while (p < closeStart) {
     const e = text.indexOf('\n', p);
     const line = e === -1 ? text.slice(p) : text.slice(p, e);
-    if (!FM_BLANK.test(line) && line.charCodeAt(0) !== 35) {
+    if (!isBlankLine(line) && line.charCodeAt(0) !== 35) {
       const m = FM_LINE.exec(line);
       if (!m) return { error: `line ${idx + 1} is not "key: value"` };
       const key = m[1];
@@ -202,65 +201,150 @@ export function parseFrontMatter(text) {
 
 // ---------------------------------------------------------------- markdown
 
-const BLANK = /^[ \t]*$/;
-const FENCE_OPEN = /^```([A-Za-z0-9_+-]*)[ \t]*$/;
-const FENCE_CLOSE = /^```[ \t]*$/;
-const HEADING = /^(#{1,6})[ \t]+(.*?)[ \t]*$/;
-const HR = /^(?:---|\*\*\*)[ \t]*$/;
-const BULLET = /^[-*] (.*)$/;
-const ORDERED = /^(\d{1,9})\. (.*)$/;
-const CONTINUED = /^ {2,}\S/;
-const TRIM_RE = /^[ \t]+|[ \t]+$/g;
 const WS_RE = /\s/;
+
+/** Whether `c` is a JavaScript \s whitespace character (shared by the word counter and the list check). */
+function isWsCode(c) {
+  return c === 32 || c === 9 || c === 10 || c === 11 || c === 12 || c === 13 || c === 160 || c === 0x1680 ||
+    (c >= 0x2000 && c <= 0x200a) || c === 0x2028 || c === 0x2029 || c === 0x202f || c === 0x205f ||
+    c === 0x3000 || c === 0xfeff;
+}
+
+/** Whether `line` holds only spaces and tabs (the empty line included). */
+function isBlankLine(line) {
+  for (let i = 0; i < line.length; i++) {
+    const c = line.charCodeAt(i);
+    if (c !== 32 && c !== 9) return false;
+  }
+  return true;
+}
+
+/** A fence-opening line's language ("" when none), or null when it is not one. The caller has checked the first three backticks. */
+function fenceLangOf(line) {
+  let i = 3;
+  while (i < line.length) {
+    const c = line.charCodeAt(i);
+    if ((c >= 65 && c <= 90) || (c >= 97 && c <= 122) || (c >= 48 && c <= 57) || c === 95 || c === 43 || c === 45) i++;
+    else break;
+  }
+  let j = i;
+  while (j < line.length && (line.charCodeAt(j) === 32 || line.charCodeAt(j) === 9)) j++;
+  return j === line.length ? line.slice(3, i) : null;
+}
+
+/** Whether `line` closes a fence: ``` and then only spaces and tabs. The caller has checked the first three backticks. */
+function isFenceClose(line) {
+  for (let i = 3; i < line.length; i++) {
+    const c = line.charCodeAt(i);
+    if (c !== 32 && c !== 9) return false;
+  }
+  return true;
+}
+
+/** Whether `line` is a thematic break: --- or *** and then only spaces and tabs. */
+function isHr(line) {
+  const c = line.charCodeAt(0);
+  if (c !== 45 && c !== 42) return false;
+  if (line.charCodeAt(1) !== c || line.charCodeAt(2) !== c) return false;
+  for (let i = 3; i < line.length; i++) {
+    const d = line.charCodeAt(i);
+    if (d !== 32 && d !== 9) return false;
+  }
+  return true;
+}
+
+/** A bullet line's item text (after "- " or "* "), or null. */
+function bulletOf(line) {
+  const c = line.charCodeAt(0);
+  if ((c === 45 || c === 42) && line.charCodeAt(1) === 32) return line.slice(2);
+  return null;
+}
+
+/** An ordered line's { start, text }, or null: 1-9 digits, ". ", then the text. */
+function orderedOf(line) {
+  let i = 0;
+  let start = 0;
+  while (i < line.length && i < 9) {
+    const c = line.charCodeAt(i);
+    if (c < 48 || c > 57) break;
+    start = start * 10 + (c - 48);
+    i++;
+  }
+  if (i === 0) return null;
+  if (i < line.length && line.charCodeAt(i) >= 48 && line.charCodeAt(i) <= 57) return null;
+  if (line.charCodeAt(i) !== 46 || line.charCodeAt(i + 1) !== 32) return null;
+  return { start, text: line.slice(i + 2) };
+}
+
+/** Whether `line` continues a list item: two or more spaces, then a non-whitespace character. */
+function isContinued(line) {
+  let i = 0;
+  while (i < line.length && line.charCodeAt(i) === 32) i++;
+  return i >= 2 && i < line.length && !isWsCode(line.charCodeAt(i));
+}
 
 /** A heading line's level and text, or null (a heading's text is never empty). */
 function headingOf(line) {
   if (line.charCodeAt(0) !== 35) return null;
-  const m = HEADING.exec(line);
-  return m === null || m[2] === '' ? null : { depth: m[1].length, text: m[2] };
+  let depth = 0;
+  while (depth < line.length && line.charCodeAt(depth) === 35) depth++;
+  if (depth > 6) return null;
+  let i = depth;
+  if (i >= line.length || (line.charCodeAt(i) !== 32 && line.charCodeAt(i) !== 9)) return null;
+  while (i < line.length && (line.charCodeAt(i) === 32 || line.charCodeAt(i) === 9)) i++;
+  let end = line.length;
+  while (end > i && (line.charCodeAt(end - 1) === 32 || line.charCodeAt(end - 1) === 9)) end--;
+  if (end === i) return null;
+  return { depth, text: line.slice(i, end) };
 }
 
 /** Whether `line` ends a paragraph: a blank line, a fence, a heading or a thematic break. */
 function endsParagraph(line) {
   if (line === '') return true;
   const c = line.charCodeAt(0);
-  if (c === 32 || c === 9) return BLANK.test(line);
-  if (c === 96) return FENCE_OPEN.test(line);
+  if (c === 32 || c === 9) return isBlankLine(line);
+  if (c === 96) return line.charCodeAt(1) === 96 && line.charCodeAt(2) === 96 && fenceLangOf(line) !== null;
   if (c === 35) return headingOf(line) !== null;
-  if (c === 45 || c === 42) return HR.test(line);
+  if (c === 45 || c === 42) return isHr(line);
   return false;
 }
 
 /** A paragraph line as it is rendered: spaces and tabs at either end dropped. */
-const trimLine = (line) => line.replace(TRIM_RE, '');
+function trimLine(line) {
+  let a = 0;
+  let b = line.length;
+  while (a < b && (line.charCodeAt(a) === 32 || line.charCodeAt(a) === 9)) a++;
+  while (b > a && (line.charCodeAt(b - 1) === 32 || line.charCodeAt(b - 1) === 9)) b--;
+  return a === 0 && b === line.length ? line : line.slice(a, b);
+}
 
 /** The characters a backslash escapes. */
 const ESCAPABLE = new Set(['\\', '`', '*', '_', '[', ']', '(', ')', '#', '+', '-', '.', '!', '>']);
 
-/** The first index from `from` where `s` holds `what` outside a backslash escape, or -1. */
+/** The first index from `from` where `s` holds `what` outside a backslash escape, or -1. Found with indexOf, then the run of backslashes just before it decides: an odd run escapes `what`'s first character (which is escapable), an even run leaves it bare. The run is counted back to `from`, matching the scan that starts fresh there. */
 function findUnescaped(s, what, from, end) {
-  const last = end - what.length;
-  for (let j = from; j <= last; j++) {
-    if (s[j] === '\\' && j + 1 < end && ESCAPABLE.has(s[j + 1])) {
-      j++;
-      continue;
-    }
-    if (s.startsWith(what, j)) return j;
+  let j = s.indexOf(what, from);
+  while (j !== -1 && j + what.length <= end) {
+    let bs = 0;
+    for (let k = j - 1; k >= from && s[k] === '\\'; k--) bs++;
+    if (bs % 2 === 0) return j;
+    j = s.indexOf(what, j + 1);
   }
   return -1;
 }
 
 /** The first single * from `from` (one whose run is not **), outside an escape, or -1. */
 function findSingleStar(s, from, end) {
-  for (let j = from; j < end; j++) {
-    const c = s[j];
-    if (c === '\\' && j + 1 < end && ESCAPABLE.has(s[j + 1])) {
-      j++;
+  let j = s.indexOf('*', from);
+  while (j !== -1 && j < end) {
+    let bs = 0;
+    for (let k = j - 1; k >= from && s[k] === '\\'; k--) bs++;
+    if (bs % 2 === 1) {
+      j = s.indexOf('*', j + 1);
       continue;
     }
-    if (c !== '*') continue;
     if (s[j + 1] === '*') {
-      j++;
+      j = s.indexOf('*', j + 2);
       continue;
     }
     return j;
@@ -277,15 +361,15 @@ function inlineRange(s, a, b, link, out) {
   let i = a;
   let seg = a;
   while (i < b) {
-    const c = s[i];
-    if (c === '\\' && i + 1 < b && ESCAPABLE.has(s[i + 1])) {
+    const c = s.charCodeAt(i);
+    if (c === 92 && i + 1 < b && ESCAPABLE.has(s[i + 1])) {
       if (i > seg) out.push(s.slice(seg, i));
       out.push(ESCAPES[s[i + 1]] ?? s[i + 1]);
       i += 2;
       seg = i;
       continue;
     }
-    if (c === '`') {
+    if (c === 96) {
       const j = s.indexOf('`', i + 1);
       if (j !== -1 && j < b && j > i + 1) {
         if (i > seg) out.push(s.slice(seg, i));
@@ -295,8 +379,8 @@ function inlineRange(s, a, b, link, out) {
       } else i++;
       continue;
     }
-    if (c === '*') {
-      if (s[i + 1] === '*') {
+    if (c === 42) {
+      if (s.charCodeAt(i + 1) === 42) {
         const j = findUnescaped(s, '**', i + 2, b);
         if (j !== -1 && j > i + 2) {
           if (i > seg) out.push(s.slice(seg, i));
@@ -324,7 +408,7 @@ function inlineRange(s, a, b, link, out) {
       } else i++;
       continue;
     }
-    if (c === '[') {
+    if (c === 91) {
       const k = findUnescaped(s, ']', i + 1, b);
       let m = -1;
       if (k !== -1 && s[k + 1] === '(') {
@@ -342,15 +426,20 @@ function inlineRange(s, a, b, link, out) {
       } else i++;
       continue;
     }
-    const esc = ESCAPES[c];
-    if (esc !== undefined) {
-      if (i > seg) out.push(s.slice(seg, i));
-      out.push(esc);
+    let esc;
+    if (c === 38) esc = '&amp;';
+    else if (c === 60) esc = '&lt;';
+    else if (c === 62) esc = '&gt;';
+    else if (c === 34) esc = '&quot;';
+    else if (c === 39) esc = '&#39;';
+    else {
       i++;
-      seg = i;
       continue;
     }
+    if (i > seg) out.push(s.slice(seg, i));
+    out.push(esc);
     i++;
+    seg = i;
   }
   if (b > seg) out.push(s.slice(seg, b));
 }
@@ -372,22 +461,22 @@ function renderMarkdown(src, link, slugCache) {
   while (i < n) {
     const line = lines[i];
     const c0 = line.charCodeAt(0);
-    if (line === '' || ((c0 === 32 || c0 === 9) && BLANK.test(line))) {
+    if (line === '' || ((c0 === 32 || c0 === 9) && isBlankLine(line))) {
       i++;
       continue;
     }
-    const fence = c0 === 96 && line.charCodeAt(1) === 96 && line.charCodeAt(2) === 96 ? FENCE_OPEN.exec(line) : null;
-    if (fence !== null) {
+    const lang = c0 === 96 && line.charCodeAt(1) === 96 && line.charCodeAt(2) === 96 ? fenceLangOf(line) : null;
+    if (lang !== null) {
       const body = [];
       i++;
       while (i < n) {
         const l = lines[i];
-        if (l.charCodeAt(0) === 96 && l.charCodeAt(1) === 96 && l.charCodeAt(2) === 96 && FENCE_CLOSE.test(l)) break;
+        if (l.charCodeAt(0) === 96 && l.charCodeAt(1) === 96 && l.charCodeAt(2) === 96 && isFenceClose(l)) break;
         body.push(l);
         i++;
       }
       i++;
-      const cls = fence[1] === '' ? '' : ` class="language-${escapeHtml(fence[1])}"`;
+      const cls = lang === '' ? '' : ` class="language-${escapeHtml(lang)}"`;
       out.push('<pre><code', cls, '>', body.length === 0 ? '' : escapeHtml(`${body.join('\n')}\n`), '</code></pre>\n');
       continue;
     }
@@ -402,7 +491,7 @@ function renderMarkdown(src, link, slugCache) {
       i++;
       continue;
     }
-    if ((c0 === 45 || c0 === 42) && HR.test(line)) {
+    if ((c0 === 45 || c0 === 42) && isHr(line)) {
       out.push('<hr>\n');
       i++;
       continue;
@@ -421,28 +510,26 @@ function renderMarkdown(src, link, slugCache) {
       if (kept.length === 0) out.push('<blockquote>\n</blockquote>\n');
       else {
         const text = kept.join('\n');
-        const tmp = [];
-        inlineRange(text, 0, text.length, link, tmp);
-        out.push('<blockquote>\n<p>', tmp.join(''), '</p>\n</blockquote>\n');
+        out.push('<blockquote>\n<p>');
+        inlineRange(text, 0, text.length, link, out);
+        out.push('</p>\n</blockquote>\n');
       }
       continue;
     }
-    const bullet = c0 === 45 || c0 === 42 ? BULLET.exec(line) : null;
-    const ordered = bullet === null && c0 >= 48 && c0 <= 57 ? ORDERED.exec(line) : null;
+    const bullet = c0 === 45 || c0 === 42 ? bulletOf(line) : null;
+    const ordered = bullet === null && c0 >= 48 && c0 <= 57 ? orderedOf(line) : null;
     if (bullet !== null || ordered !== null) {
       const isOrdered = ordered !== null;
-      const marker = isOrdered ? ORDERED : BULLET;
-      const start = isOrdered ? Number(ordered[1]) : 1;
+      const start = isOrdered ? ordered.start : 1;
       const items = [];
       while (i < n) {
         const l = lines[i];
         const mc = l.charCodeAt(0);
-        const okFirst = isOrdered ? mc >= 48 && mc <= 57 : mc === 45 || mc === 42;
-        const m = okFirst ? marker.exec(l) : null;
+        const m = isOrdered ? (mc >= 48 && mc <= 57 ? orderedOf(l) : null) : (mc === 45 || mc === 42 ? bulletOf(l) : null);
         if (m !== null) {
-          items.push([trimLine(isOrdered ? m[2] : m[1])]);
+          items.push([trimLine(isOrdered ? m.text : m)]);
           i++;
-        } else if (CONTINUED.test(l)) {
+        } else if (isContinued(l)) {
           items[items.length - 1].push(trimLine(l));
           i++;
         } else break;
@@ -451,9 +538,9 @@ function renderMarkdown(src, link, slugCache) {
       out.push(isOrdered && start !== 1 ? `<ol start="${start}">\n` : `<${tag}>\n`);
       for (const parts of items) {
         const text = parts.join('\n');
-        const tmp = [];
-        inlineRange(text, 0, text.length, link, tmp);
-        out.push('<li>', tmp.join(''), '</li>\n');
+        out.push('<li>');
+        inlineRange(text, 0, text.length, link, out);
+        out.push('</li>\n');
       }
       out.push(`</${tag}>\n`);
       continue;
@@ -629,9 +716,21 @@ function renderNodes(nodes, scope, ctx, depth, out) {
       case 'for': {
         const xs = lookup(scope, node.path);
         if (!Array.isArray(xs)) break;
+        // One vars object, one loop record and one child scope for the whole
+        // loop, mutated per item: rendering is synchronous, so nothing keeps
+        // them past the iteration that reads them. `loop` is re-asserted
+        // after the item, so a loop variable actually named "loop" still
+        // reads the loop record, as the object literal did.
+        const loop = { index: 0, first: false, last: false, length: xs.length };
+        const vars = { [node.name]: undefined, loop };
+        const child = { vars, parent: scope };
         for (let k = 0; k < xs.length; k++) {
-          const vars = { [node.name]: xs[k], loop: { index: k + 1, first: k === 0, last: k === xs.length - 1, length: xs.length } };
-          renderNodes(node.body, { vars, parent: scope }, ctx, depth, out);
+          vars[node.name] = xs[k];
+          vars.loop = loop;
+          loop.index = k + 1;
+          loop.first = k === 0;
+          loop.last = k === xs.length - 1;
+          renderNodes(node.body, child, ctx, depth, out);
         }
         break;
       }
@@ -655,10 +754,30 @@ const REPORT_FILE = 'build-report.txt';
 const SCHEME_RE = /^[A-Za-z][A-Za-z0-9+.-]*:/;
 const CRLF_RE = /\r\n?/g;
 
-/** The words of a body: its runs of characters other than whitespace. */
+/** The words of a body: its runs of characters other than whitespace. Counted
+ * by scanning, never by building the array of the words. The whitespace set
+ * is JavaScript's \s exactly: U+0020 and U+0009-U+000D below space, and
+ * U+00A0, U+1680, U+2000-U+200A, U+2028, U+2029, U+202F, U+205F, U+3000,
+ * U+FEFF above it. The common case (an ASCII letter) costs two comparisons. */
 function wordsOf(text) {
-  const m = text.match(/\S+/g);
-  return m === null ? 0 : m.length;
+  let n = 0;
+  let inWord = false;
+  for (let i = 0; i < text.length; i++) {
+    const c = text.charCodeAt(i);
+    if (c > 32) {
+      if (c < 128 || !isWsCode(c)) {
+        if (!inWord) {
+          n++;
+          inWord = true;
+        }
+      } else inWord = false;
+    } else if (c === 32 || (c >= 9 && c <= 13)) inWord = false;
+    else if (!inWord) {
+      n++;
+      inWord = true;
+    }
+  }
+  return n;
 }
 
 /** `rel` (a link's path, "/"-separated) from the directory `dir` of a source, or null when it climbs out of the root. */
@@ -704,7 +823,8 @@ function build(input) {
   const sources = [];
   const statics = [];
   for (const f of files) {
-    if (f.path.endsWith('.md')) sources.push({ path: f.path, text: f.content.replace(CRLF_RE, '\n') });
+    // Most sources hold no carriage return at all; skip the regex then.
+    if (f.path.endsWith('.md')) sources.push({ path: f.path, text: f.content.indexOf('\r') === -1 ? f.content : f.content.replace(CRLF_RE, '\n') });
     else statics.push({ path: f.path, content: f.content });
   }
 
